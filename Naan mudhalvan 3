@@ -1,0 +1,80 @@
+import os
+import librosa
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Reshape, LSTM, Dense
+from tensorflow.keras.optimizers import Adam
+from evaluate import compute_metrics
+from augment import augment_audio
+from preprocess import preprocess_audio
+from adapt import apply_mllr
+import soundfile as sf
+
+# Directories and files
+DATA_DIR = "data/audio"
+META_FILE = "data/metadata.csv"
+OUTPUT_METRICS = "metrics_for_powerbi.csv"
+
+# Load metadata
+df = pd.read_csv(META_FILE)
+
+# Preprocess and augment data
+X = []
+y = []
+accents = []
+
+for index, row in df.iterrows():
+    path = os.path.join(DATA_DIR, row['filename'])
+    accent = row['accent']
+    transcript = row['transcript']
+
+    try:
+        audio, sr = sf.read(path)
+        audio = preprocess_audio(audio, sr)
+        audio = augment_audio(audio, sr)
+        features = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
+        X.append(features.T)
+        y.append(transcript)
+        accents.append(accent)
+    except Exception as e:
+        print(f"Skipping {path}: {e}")
+
+# Pad sequences
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+X = pad_sequences(X, dtype='float32', padding='post')
+
+# Encode labels (simple dummy target)
+from sklearn.preprocessing import LabelEncoder
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+
+# Train-test split
+X_train, X_test, y_train, y_test, accents_train, accents_test = train_test_split(X, y_encoded, accents, test_size=0.2, stratify=accents)
+
+# Apply speaker adaptation
+X_train = apply_mllr(X_train, accents_train)
+X_test = apply_mllr(X_test, accents_test)
+
+# Model definition
+input_layer = Input(shape=(X_train.shape[1], X_train.shape[2], 1))
+x = Conv2D(32, kernel_size=(3, 3), activation='relu')(input_layer)
+x = MaxPooling2D(pool_size=(2, 2))(x)
+x = Reshape((x.shape[1], x.shape[2] * x.shape[3]))(x)
+x = LSTM(64, return_sequences=False)(x)
+output_layer = Dense(len(le.classes_), activation='softmax')(x)
+
+model = Model(inputs=input_layer, outputs=output_layer)
+model.compile(loss='sparse_categorical_crossentropy', optimizer=Adam(), metrics=['accuracy'])
+
+# Train
+model.fit(X_train, y_train, epochs=10, batch_size=32, validation_split=0.2)
+
+# Evaluate
+y_pred = model.predict(X_test)
+metrics_df = compute_metrics(y_test, y_pred, accents_test, le)
+metrics_df.to_csv(OUTPUT_METRICS, index=False)
+
+# Save model
+model.save("checkpoints/accent_asr_model.h5")
