@@ -1,0 +1,109 @@
+import os
+import torch
+import torchaudio
+from datasets import load_dataset, load_metric
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, TrainingArguments, Trainer
+import numpy as np
+import pandas as pd
+import soundfile as sf
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+
+# Load Common Voice Dataset
+dataset = load_dataset("mozilla-foundation/common_voice_21_0", "en", split="train[:1%]")
+
+# Load Wav2Vec2 pre-trained processor and model
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
+
+# Resample audio to 16kHz
+resampler = torchaudio.transforms.Resample(orig_freq=48_000, new_freq=16_000)
+
+def speech_file_to_array_fn(batch):
+    speech_array, sampling_rate = sf.read(batch["path"])
+    if sampling_rate != 16000:
+        speech_array = resampler(torch.tensor(speech_array)).numpy()
+    batch["speech"] = speech_array
+    batch["input_values"] = processor(speech_array, sampling_rate=16000).input_values[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+dataset = dataset.map(speech_file_to_array_fn)
+
+# Define data collator
+@dataclass
+class DataCollatorCTCWithPadding:
+    processor: Wav2Vec2Processor
+    padding: Union[bool, str] = True
+
+    def _call_(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        input_values = [f["input_values"] for f in features]
+        labels = [f["labels"] for f in features]
+        batch = self.processor.pad(input_values=input_values, padding=self.padding, return_tensors="pt")
+        with self.processor.as_target_processor():
+            labels_batch = self.processor.pad(labels=labels, padding=self.padding, return_tensors="pt")
+        batch["labels"] = labels_batch["input_ids"]
+        return batch
+
+data_collator = DataCollatorCTCWithPadding(processor=processor)
+
+# Define evaluation metrics
+wer_metric = load_metric("wer")
+
+def compute_metrics(pred):
+    pred_logits = pred.predictions
+    pred_ids = np.argmax(pred_logits, axis=-1)
+    pred_str = processor.batch_decode(pred_ids)
+    label_ids = pred.label_ids
+    label_str = processor.batch_decode(label_ids, group_tokens=False)
+    wer = wer_metric.compute(predictions=pred_str, references=label_str)
+    return {"wer": wer}
+
+# Training configuration
+training_args = TrainingArguments(
+    output_dir="./stt_model",
+    group_by_length=True,
+    per_device_train_batch_size=8,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    logging_dir="./logs",
+    fp16=True,
+    num_train_epochs=3,
+    learning_rate=1e-4,
+    save_total_limit=2,
+)
+
+# Train the model
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    eval_dataset=dataset,
+    tokenizer=processor.feature_extractor,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+# Save the model and metrics
+model.save_pretrained("./final_model")
+processor.save_pretrained("./final_model")
+
+# Run predictions and export for Power BI
+results = trainer.predict(dataset)
+wer = compute_metrics(results)
+df_metrics = pd.DataFrame([wer])
+df_metrics.to_csv("metrics_for_powerbi.csv", index=False)
+
+
+
+
+
+
+
+
+
+
+
+
