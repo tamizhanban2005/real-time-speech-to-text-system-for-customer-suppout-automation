@@ -1,0 +1,62 @@
+import speech_recognition as sr
+import textblob
+import csv
+import jiwer
+import os
+from collections import Counter
+from nltk.corpus import stopwords
+import nltk
+nltk.download("punkt")
+nltk.download("stopwords")
+
+def transcribe_audio(file_path):
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(file_path) as source:
+        audio = recognizer.record(source)
+    try:
+        return recognizer.recognize_google(audio)
+    except sr.UnknownValueError:
+        return "[Unintelligible]"
+    except sr.RequestError as e:
+        return f"[API error: {e}]"
+
+def analyze_sentiment(text):
+    polarity = textblob.TextBlob(text).sentiment.polarity
+    if polarity > 0.1:
+        return "Positive"
+    elif polarity < -0.1:
+        return "Negative"
+    else:
+        return "Neutral"
+
+def extract_keywords(text, top_n=5):
+    words = [word.lower() for word in nltk.word_tokenize(text) if word.isalnum()]
+    words = [w for w in words if w not in stopwords.words("english")]
+    return [word for word, _ in Counter(words).most_common(top_n)]
+
+def calculate_metrics(reference, hypothesis):
+    wer = jiwer.wer(reference, hypothesis)
+    cer = jiwer.cer(reference, hypothesis)
+    return wer, cer
+
+def save_metrics(file, transcription, sentiment, keywords, wer, cer):
+    with open(file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Transcription", "Sentiment", "Keywords", "WER", "CER"])
+        writer.writerow([transcription, sentiment, str(keywords), round(wer, 4), round(cer, 4)])
+
+if _name_ == "_main_":
+    audio_path = "sample.wav"
+    ground_truth = "hi i need help with my order it hasnt arrived yet"
+
+    print("[INFO] Transcribing audio...")
+    transcription = transcribe_audio(audio_path)
+    print("[INFO] Transcription:", transcription)
+
+    sentiment = analyze_sentiment(transcription)
+    keywords = extract_keywords(transcription)
+    wer, cer = calculate_metrics(ground_truth, transcription.lower())
+
+    print("[INFO] Saving metrics to CSV...")
+    save_metrics("metrics.csv", transcription, sentiment, keywords, wer, cer)
+    print("[DONE] Results saved to metrics.csv")
